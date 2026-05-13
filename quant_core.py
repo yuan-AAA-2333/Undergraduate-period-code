@@ -1,309 +1,78 @@
 import torch
-import torch.nn as nn
 
-EPS = 1e-8  # 防止分母为0的极小值
-UNIFIED_SEED = 42  # 随机数种子统一固定，确保1/2/4bit随机计算的随机性完全一致
-DEFAULT_STREAM_LEN = 32  # 1bit随机计算-比特流长度
-DEFAULT_GROUP_NUM = 32  # 2/4bit随机计算-数值分组数量
-
-
-def get_unified_rng(device: torch.device) -> torch.Generator:
-    """全局统一伪随机数生成器 - 所有随机计算量化共用，保证随机性一致，只对比计算过程差异"""
-    return torch.Generator(device=device).manual_seed(UNIFIED_SEED)
+# SC量化核心配置
+SC_STREAM_LEN = 32  # 比特流长度，可调：8/10/16
+SC_SEED = 42
+torch.manual_seed(SC_SEED)
 
 
-def tensor_normalize(x: torch.Tensor) -> torch.Tensor:
-    """张量归一化到[0,experiment_1]区间 - 所有量化的前置步骤"""
-    x_min = torch.min(x)
-    x_max = torch.max(x)
-    return (x - x_min) / (x_max - x_min + EPS)
-
-
-def tensor_denormalize(x_norm: torch.Tensor, x_ori: torch.Tensor) -> torch.Tensor:
-    """张量反归一化回原始值域 - 所有量化的后置步骤"""
-    x_min = torch.min(x_ori)
-    x_max = torch.max(x_ori)
-    return x_norm * (x_max - x_min) + x_min
-
-
-
-def quant_1bit_normal(x: torch.Tensor) -> torch.Tensor:
-    """常规1bit量化 (二值量化) """
-    scale = torch.max(torch.abs(x))
-    quant_x = torch.sign(x) * scale
-    quant_x = torch.clamp(quant_x, -scale, scale)
-    return quant_x
-
-
-def dequant_1bit_normal(x_quant: torch.Tensor) -> torch.Tensor:
-    """常规1bit反量化"""
-    return x_quant
-
-
-def quant_2bit_normal(x: torch.Tensor) -> torch.Tensor:
-    """常规2bit量化 - 等间隔4级量化 [0, experiment_1/3, 2/3, experiment_1]，纯确定性映射"""
-    x_norm = tensor_normalize(x)
-    quant_level = 4  # 2bit对应量化等级数: 2^2=4
-    quant_x = torch.round(x_norm * (quant_level - 1)) / (quant_level - 1)
-    return tensor_denormalize(quant_x, x)
-
-
-def dequant_2bit_normal(x_quant: torch.Tensor) -> torch.Tensor:
-    """常规2bit反量化"""
-    return x_quant
-
-
-def quant_4bit_normal(x: torch.Tensor) -> torch.Tensor:
-    """常规4bit量化 - 等间隔16级量化，纯确定性映射，无任何随机/统计"""
-    x_norm = tensor_normalize(x)
-    quant_level = 16  # 4bit对应量化等级数: 2^4=16
-    quant_x = torch.round(x_norm * (quant_level - 1)) / (quant_level - 1)
-    return tensor_denormalize(quant_x, x)
-
-
-def dequant_4bit_normal(x_quant: torch.Tensor) -> torch.Tensor:
-    """常规4bit反量化"""
-    return x_quant
-
-
-
-def sc_quant_1bit(x: torch.Tensor, stream_len: int = DEFAULT_STREAM_LEN) -> tuple[torch.Tensor, torch.Tensor]:
-    """1bit随机计算量化 - 可导版 ✅ 完美保留梯度流 + 兼容任意维度 + 保留所有原始逻辑"""
-    device = x.device
-    x_norm = tensor_normalize(x)
-    prob = x_norm  # 数值大小 = 取1的概率，核心逻辑不变
-
-    # 统一随机数生成，保留不动
-    rng = get_unified_rng(device)
-    rand_mat = torch.rand(x.shape + (stream_len,), device=device, generator=rng)
-
-    # ✅ 维度适配修复（之前的问题，保留）
-    prob = prob.unsqueeze(dim=-1)
-    repeat_dims = [1] * prob.dim()
-    repeat_dims[-1] = stream_len
-    prob = prob.repeat(*repeat_dims)
-
-    # ✅ 梯度核心修复1：用【可导的软比较】替代不可导的硬比较 rand_mat < prob
-    # 效果完全一样：输出0~1的比特流，训练时可导，推理时就是0/1，完美兼容
-    bit_stream = torch.sigmoid(10.0 * (prob - rand_mat))
-    # ✅ 梯度核心修复2：强制开启梯度追踪，确保比特流有grad_fn
-    bit_stream.requires_grad_(True)
-
-    return bit_stream, prob
-
-
-# ===================== 核心修复2：可导的 1bit逻辑门运算【梯度完美保留】=====================
-def sc_1bit_multiply(bit_stream_a: torch.Tensor, bit_stream_b: torch.Tensor) -> torch.Tensor:
-    """1bit乘法-AND门 ✅ 可导等价替换：逻辑与 = 算术乘法，输出结果完全一致，支持梯度回传"""
-    # 原逻辑：torch.logical_and(a,b).float() → 不可导
-    # 新逻辑：a*b → 可导，且0*0=0,0*1=0,1*1=1，和AND门完全等价！
-    return (bit_stream_a * bit_stream_b).float().requires_grad_(True)
-
-
-def sc_1bit_add(bit_stream_a: torch.Tensor, bit_stream_b: torch.Tensor) -> torch.Tensor:
-    """1bit加法-XOR门 ✅ 可导等价替换：逻辑异或 = 绝对值相减，输出结果完全一致，支持梯度回传"""
-    # 原逻辑：torch.logical_xor(a,b).float() → 不可导
-    # 新逻辑：torch.abs(a-b) → 可导，且0-0=0,0-1=1,1-1=0，和XOR门完全等价！
-    return torch.abs(bit_stream_a - bit_stream_b).float().requires_grad_(True)
-
-
-# ===================== 核心修复3：可导的 sc_1bit_decode 解码函数【梯度完美保留】=====================
-def sc_1bit_decode(bit_stream: torch.Tensor) -> torch.Tensor:
-    """1bit随机计算解码 ✅ 完美保留梯度 + 保留所有原始逻辑 + 设备对齐"""
-    # 统计1的占比，核心逻辑不变
-    decoded_x = torch.mean(bit_stream, dim=-1).to(bit_stream.device)
-    # 梯度核心修复3：强制开启梯度追踪 + 克隆张量保留grad_fn梯度图
-    decoded_x = decoded_x.clone().requires_grad_(True)
-    return decoded_x
-
-# --------------------------（由于1bit量化不可导，废弃）
-# 2.experiment_1 随机计算量化 1bit 实现 + 专属计算法则 (计算极简：比特流 + 逻辑门运算)
-# 核心：编码输出【0/1比特流】，运算依赖硬件逻辑门(AND/XOR)，无乘除算术运算，随机计算的原生形态
-# --------------------------
-# def sc_quant_1bit(x: torch.Tensor, stream_len: int = DEFAULT_STREAM_LEN) -> tuple[torch.Tensor, torch.Tensor]:
-#     """1bit随机计算量化 - 核心输出：0/1比特流 + 概率值
-#     :param x: 输入张量 (支持任意维度：2维fc层/4维卷积特征图)
-#     :param stream_len: 比特流长度，随机计算的统计长度
-#     :return: bit_stream(输入的0/1比特流编码), prob(每个位置取1的概率)
-#     """
-#     device = x.device
-#     x_norm = tensor_normalize(x)
-#     prob = x_norm  # 随机计算核心：数值大小 = 取1的概率
+# ===================== 1. 张量量化（特征/权重通用，推理时实时量化） =====================
+# def sc_quantize(x: torch.Tensor) -> torch.Tensor:
+#     """推理时实时将FP32张量（特征/权重）转为0/1比特流"""
+#     x_min = x.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0] if x.dim() == 4 else \
+#     x.min(dim=-1, keepdim=True)[0]
+#     x_max = x.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] if x.dim() == 4 else \
+#     x.max(dim=-1, keepdim=True)[0]
+#     prob = (x - x_min) / (x_max - x_min + 1e-8)  # 映射为0~1概率
 #
-#     # 统一随机数生成 (所有随机计算共用一个发生器，随机性一致)
-#     rng = get_unified_rng(device)
-#     # 生成比特流：shape=[x_shape, stream_len]，适配任意输入维度
-#     rand_mat = torch.rand(x.shape + (stream_len,), device=device, generator=rng)
+#     rng = torch.Generator(device=x.device)
+#     rng.manual_seed(SC_SEED)
+#     rand_mat = torch.rand(x.shape + (SC_STREAM_LEN,), device=x.device, generator=rng)
 #
-#     # ✅ 终极修复核心：【自动适配任意维度】的动态repeat，再也不写死维度！
-#     prob = prob.unsqueeze(dim=-1)  # 在最后新增1个维度
-#     # 自动生成repeat参数：前面所有维度都不变(1)，最后一维复制stream_len次
+#     prob = prob.unsqueeze(-1)
 #     repeat_dims = [1] * prob.dim()
-#     repeat_dims[-1] = stream_len
+#     repeat_dims[-1] = SC_STREAM_LEN
 #     prob = prob.repeat(*repeat_dims)
 #
-#     bit_stream = (rand_mat < prob).float()
-#     return bit_stream, prob
-#
-#
-# def sc_1bit_multiply(bit_stream_a: torch.Tensor, bit_stream_b: torch.Tensor) -> torch.Tensor:
-#     """1bit随机计算 乘法法则 - 纯硬件逻辑门(AND门)运算，无算术乘法，这是1bit的核心特征"""
-#     return torch.logical_and(bit_stream_a, bit_stream_b).float()
-#
-#
-# def sc_1bit_add(bit_stream_a: torch.Tensor, bit_stream_b: torch.Tensor) -> torch.Tensor:
-#     """1bit随机计算 加法法则 - 纯硬件逻辑门(XOR门)运算，无算术加法"""
-#     return torch.logical_xor(bit_stream_a, bit_stream_b).float()
-#
-#
-# def sc_1bit_decode(bit_stream: torch.Tensor) -> torch.Tensor:
-#     """1bit随机计算 解码法则 - 统计比特流中1的占比，无算术除法(仅统计均值)"""
-#     # 小修复：保留张量设备，避免后续隐性设备不匹配，其他逻辑不变
-#     return torch.mean(bit_stream, dim=-1).to(bit_stream.device)
-
-
-# --------------------------
-# 2.2 随机计算量化 2bit 实现 + 专属计算法则 (计算复杂：数值流 + 算术运算)
-# 核心：编码输出【多值数值流】，运算依赖算术乘除，失去1bit的逻辑门极简特性，这是你重点强调的差异！
-# --------------------------
-def sc_quant_2bit(x: torch.Tensor, group_num: int = DEFAULT_GROUP_NUM) -> torch.Tensor:
-    """2bit随机计算量化 - 核心输出：多值数值流 [0, experiment_1/3, 2/3, experiment_1]，无纯比特流，无逻辑门运算
-    :param x: 输入张量
-    :param group_num: 数值分组数量，与1bit的stream_len对应，保证统计维度一致
-    :return: value_stream 数值流，shape=[x_shape, group_num]
+#     return (rand_mat < prob).float()  # 纯0/1比特流
+def sc_quantize(x: torch.Tensor) -> torch.Tensor:
+    """推理实时量化：输出维度严格规范为 [B,C,H,W,SC_STREAM_LEN] (特征) / [C_out,C_in,k,k,SC_STREAM_LEN] (权重)
+    保证：所有量化后的张量，最后一维永远是比特流长度，前面是原张量维度，彻底解决维度匹配问题
     """
-    device = x.device
-    x_norm = tensor_normalize(x)
-    # 2bit随机计算的数值映射表：4个等级，与常规2bit一致
-    value_map = torch.tensor([0.0, 1 / 3, 2 / 3, 1.0], device=device)
+    # 自适应min-max归一化，适配卷积权重(4D)、特征图(4D)、全连接权重(2D)
+    x = x.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    # 修复关键：全局求min/max，不用传dim列表，彻底解决TypeError，归一化更稳定
+    x_min = torch.min(x)
+    x_max = torch.max(x)
+    # dims = [i for i in range(x.dim()) if i not in [0]] if x.dim() == 4 else [i for i in range(x.dim())]
+    # x_min = x.min(dim=dims, keepdim=True)[0]
+    # x_max = x.max(dim=dims, keepdim=True)[0]
+    prob = (x - x_min) / (x_max - x_min + 1e-8)  # 映射0~1概率
 
-    # 概率分布推导：随机计算核心 - 数学期望 = 输入归一化值
-    p00 = torch.clamp(1 - 3 * x_norm, 0, 1)
-    p01 = torch.clamp(3 * x_norm - p00, 0, 1)
-    p10 = torch.clamp(1 - p00 - p01, 0, 1)
-    p11 = torch.clamp(1 - p00 - p01 - p10, 0, 1)
-    prob_dist = torch.stack([p00, p01, p10, p11], dim=-1)
+    # 生成随机矩阵：严格在【原张量维度后拼接比特流维度】
+    rng = torch.Generator(device=x.device)
+    rng.manual_seed(SC_SEED)
+    rand_mat = torch.rand(x.shape + (SC_STREAM_LEN,), device=x.device, generator=rng)
 
-    # 统一随机数生成 (和1bit完全一致，保证随机性无差异，只对比计算过程)
-    rng = get_unified_rng(device)
-    rand_mat = torch.rand(x.shape + (group_num,), device=device, generator=rng)
+    # 概率矩阵扩维：只扩最后一维，匹配随机矩阵
+    prob = prob.unsqueeze(dim=-1).repeat(*[1] * x.dim(), SC_STREAM_LEN)
 
-    # 生成数值流：根据概率分布采样得到多值序列，不是0/1比特流！
-    cum_prob = torch.cumsum(prob_dist, dim=-1)
-    group_idx = torch.searchsorted(cum_prob, rand_mat.unsqueeze(-1)).squeeze(-1)
-    value_stream = value_map[group_idx]
-
-    return value_stream
-
-
-def sc_2bit_multiply(value_stream_a: torch.Tensor, value_stream_b: torch.Tensor) -> torch.Tensor:
-    """2bit随机计算 乘法法则 - 算术乘法运算，与1bit的AND门完全不同，计算复杂度提升"""
-    return value_stream_a * value_stream_b
+    # 纯逻辑比较，生成0/1比特流，维度绝对规范
+    bit_stream = (rand_mat < prob).float()
+    return bit_stream
 
 
-def sc_2bit_add(value_stream_a: torch.Tensor, value_stream_b: torch.Tensor) -> torch.Tensor:
-    """2bit随机计算 加法法则 - 算术加法运算，与1bit的XOR门完全不同"""
-    return value_stream_a + value_stream_b
+# ===================== 2. SC逻辑门运算（替代浮点乘加） =====================
+def sc_and(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """SC乘法=纯AND门，替代所有浮点乘法，要求a/b可广播（维度规范后必满足）"""
+    return torch.logical_and(a, b).float()
+
+def sc_xor(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """SC加法=纯XOR门，替代所有浮点加法"""
+    return torch.logical_xor(a, b).float()
 
 
-def sc_2bit_decode(value_stream: torch.Tensor) -> torch.Tensor:
-    """2bit随机计算 解码法则 - 数值流的算术均值，必须做加法+除法，计算开销高于1bit"""
-    return torch.mean(value_stream, dim=-1)
+# ===================== 3. SC解码+配套算子（推理时还原特征） =====================
+def sc_decode(bit_stream: torch.Tensor) -> torch.Tensor:
+    """比特流解码 = 统计1的占比，还原特征判别信息"""
+    return torch.mean(bit_stream, dim=-1).to(bit_stream.device)
 
 
-# --------------------------
-# 2.3 随机计算量化 4bit 实现 + 专属计算法则 (计算更复杂：高维数值流 + 精细算术运算)
-# 核心：和2bit计算逻辑一致，都是数值流+算术运算，仅量化等级更多、数值更精细，与1bit仍为本质差异
-# --------------------------
-def sc_quant_4bit(x: torch.Tensor, group_num: int = DEFAULT_GROUP_NUM) -> torch.Tensor:
-    """4bit随机计算量化 - 核心输出：16级数值流 [0,experiment_1/15,...,14/15,experiment_1]，纯算术运算基底
-    :param x: 输入张量
-    :param group_num: 数值分组数量，与1bit/2bit保持一致，保证实验公平性
-    :return: value_stream 高维数值流，shape=[x_shape, group_num]
-    """
-    device = x.device
-    x_norm = tensor_normalize(x)
-    # 4bit随机计算的数值映射表：16个等级，与常规4bit一致
-    quant_level = 16
-    value_map = torch.linspace(0.0, 1.0, quant_level, device=device)
-
-    # 概率分布：均匀分布简化版，保证数学期望匹配输入值
-    prob = torch.ones(x.shape + (quant_level,), device=device) / quant_level
-
-    # 统一随机数生成 (和1bit/2bit完全一致，随机性无差异)
-    rng = get_unified_rng(device)
-    rand_mat = torch.rand(x.shape + (group_num,), device=device, generator=rng)
-
-    # 生成高维数值流：无比特流、无逻辑门，纯数值序列
-    cum_prob = torch.cumsum(prob, dim=-1)
-    group_idx = torch.searchsorted(cum_prob, rand_mat.unsqueeze(-1)).squeeze(-1)
-    value_stream = value_map[group_idx]
-
-    return value_stream
+def sc_avg_pool(bit_stream: torch.Tensor) -> torch.Tensor:
+    """SC池化 = 空间维度均值统计"""
+    return torch.mean(bit_stream, dim=[2, 3]) if bit_stream.dim() == 5 else bit_stream
 
 
-def sc_4bit_multiply(value_stream_a: torch.Tensor, value_stream_b: torch.Tensor) -> torch.Tensor:
-    """4bit随机计算 乘法法则 - 算术乘法，与2bit一致，比1bit逻辑门运算复杂度高一个量级"""
-    return value_stream_a * value_stream_b
-
-
-def sc_4bit_add(value_stream_a: torch.Tensor, value_stream_b: torch.Tensor) -> torch.Tensor:
-    """4bit随机计算 加法法则 - 算术加法"""
-    return value_stream_a + value_stream_b
-
-
-def sc_4bit_decode(value_stream: torch.Tensor) -> torch.Tensor:
-    """4bit随机计算 解码法则 - 数值流算术均值，计算开销最高"""
-    return torch.mean(value_stream, dim=-1)
-
-
-# ==============================================================
-# 三、快捷调用接口 (可选，为后续模型定义层提供极简调用，减少代码冗余)
-# ==============================================================
-def apply_quant(x: torch.Tensor, quant_type: str, bit: int) -> torch.Tensor:
-    """快捷量化调用：一键选择量化类型和位宽"""
-    if quant_type == "normal":
-        if bit == 1:
-            return quant_1bit_normal(x)
-        elif bit == 2:
-            return quant_2bit_normal(x)
-        elif bit == 4:
-            return quant_4bit_normal(x)
-    elif quant_type == "sc":
-        if bit == 1:
-            return sc_quant_1bit(x)[0]
-        elif bit == 2:
-            return sc_quant_2bit(x)
-        elif bit == 4:
-            return sc_quant_4bit(x)
-    return x
-
-
-def apply_sc_calc(x_a: torch.Tensor, x_b: torch.Tensor, calc_type: str, bit: int) -> torch.Tensor:
-    """快捷随机计算调用：一键选择运算类型和位宽"""
-    if calc_type == "mul":
-        if bit == 1:
-            return sc_1bit_multiply(x_a, x_b)
-        elif bit == 2:
-            return sc_2bit_multiply(x_a, x_b)
-        elif bit == 4:
-            return sc_4bit_multiply(x_a, x_b)
-    elif calc_type == "add":
-        if bit == 1:
-            return sc_1bit_add(x_a, x_b)
-        elif bit == 2:
-            return sc_2bit_add(x_a, x_b)
-        elif bit == 4:
-            return sc_4bit_add(x_a, x_b)
-    return x_a * x_b
-
-
-def apply_sc_decode(x: torch.Tensor, bit: int) -> torch.Tensor:
-    """快捷随机计算解码调用"""
-    if bit == 1:
-        return sc_1bit_decode(x)
-    elif bit == 2:
-        return sc_2bit_decode(x)
-    elif bit == 4:
-        return sc_4bit_decode(x)
-    return x
+def sc_relu(x: torch.Tensor) -> torch.Tensor:
+    """SC激活 = 逻辑阈值过滤"""
+    return torch.where(x > 0, x, torch.zeros_like(x))

@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
 
-# ==============================================================
-# 全局通用配置 & 工具函数 (所有量化共用，保证实验变量统一，避坑专用)
-# ==============================================================
 EPS = 1e-8  # 防止分母为0的极小值
 UNIFIED_SEED = 42  # 随机数种子统一固定，确保1/2/4bit随机计算的随机性完全一致
 DEFAULT_STREAM_LEN = 32  # 1bit随机计算-比特流长度
@@ -29,13 +26,9 @@ def tensor_denormalize(x_norm: torch.Tensor, x_ori: torch.Tensor) -> torch.Tenso
     return x_norm * (x_max - x_min) + x_min
 
 
-# ==============================================================
-# 一、常规确定性量化 1bit/2bit/4bit 完整实现 (对比组，无随机，无统计计算)
-# 核心特性：纯固定阈值映射、等间隔量化、无随机性、无统计均值、无额外计算开销
-# 包含：量化函数 + 反量化函数 (推理必用)
-# ==============================================================
+
 def quant_1bit_normal(x: torch.Tensor) -> torch.Tensor:
-    """常规1bit量化 (二值量化) - 行业标准实现：权重±scale，激活0/experiment_1"""
+    """常规1bit量化 (二值量化) """
     scale = torch.max(torch.abs(x))
     quant_x = torch.sign(x) * scale
     quant_x = torch.clamp(quant_x, -scale, scale)
@@ -73,13 +66,7 @@ def dequant_4bit_normal(x_quant: torch.Tensor) -> torch.Tensor:
     return x_quant
 
 
-# ==============================================================
-# 二、随机计算量化(SC) 1bit/2bit/4bit 完整实现 + 专属计算法则 (核心实验组)
-# 核心遵循你的核心要求：1bit 和 2/4bit 的计算过程、运算法则 完全不同！
-# 共性：都有【概率编码 + 统计解码】的随机计算核心特征
-# 差异性：1bit是「比特流+逻辑门运算」，2/4bit是「数值流+算术运算」
-# ==============================================================
-# ===================== 核心修复1：可导的 sc_quant_1bit 量化函数【梯度完美保留】=====================
+
 def sc_quant_1bit(x: torch.Tensor, stream_len: int = DEFAULT_STREAM_LEN) -> tuple[torch.Tensor, torch.Tensor]:
     """1bit随机计算量化 - 可导版 ✅ 完美保留梯度流 + 兼容任意维度 + 保留所有原始逻辑"""
     device = x.device
